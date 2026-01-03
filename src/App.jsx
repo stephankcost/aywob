@@ -1,17 +1,57 @@
+// ============================================================================
+// App.jsx
+// Main application component for the Counterpoint music history map.
+// ============================================================================
+//
+// DESCRIPTION:
+//   Counterpoint visualizes music history as a transit-style map, showing
+//   connections between artists through band membership, collaborations,
+//   co-writing credits, and shared record labels.
+//
+// KEY FEATURES:
+//   - Search and add artists from MusicBrainz database
+//   - Visualize artists as nodes with connection lines between them
+//   - Four connection types: Personnel (green), Studio (blue), Writing (purple), Label (yellow)
+//   - Route-finding between any two artists
+//   - Artist photos fetched from Wikidata
+//   - Dark/light mode support
+//
+// SECTIONS:
+//   1. CONSTANTS - Grid sizes, colors, labels
+//   2. API FUNCTIONS - MusicBrainz & Wikidata fetching
+//   3. GEOMETRY UTILITIES - Path generation, grid calculations
+//   4. DATA PROCESSING - Extract relationships, works, labels
+//   5. LAYOUT - Auto-positioning of artists on the map
+//   6. MAIN COMPONENT - React component with state, handlers, and render
+//
+// ============================================================================
+
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Music, Sun, Moon, Search, Loader, AlertCircle, Plus, X, Navigation } from 'lucide-react';
 
-// Transit map uses hub-based layout - artists cluster around three district hubs
-const GRID_SIZE = 150;
-const STATION_RADIUS = 20; // Increased from 14 for better visibility
-const LINE_GAP = 16; // Gap between parallel lines
 
-// Hub positions (asymmetric city layout, not perfect triangle)
-// These are transfer junctions, not artist nodes
+// ============================================================================
+// 1. CONSTANTS
+// Grid layout, hub positions, colors, and labels for the transit map
+// ============================================================================
+
+/** Grid cell size in pixels */
+const GRID_SIZE = 150;
+
+/** Radius of each station (artist node) in pixels */
+const STATION_RADIUS = 28;
+
+/** Gap between parallel connection lines */
+const LINE_GAP = 12;
+
+/**
+ * Hub positions for layout weighting
+ * Artists are positioned based on their connection types, gravitating toward relevant hubs
+ */
 const HUBS = {
   personnel: { x: -3, y: -2 },  // Northwest - "Band District"
-  studio: { x: 4, y: 2 },        // Southeast - "Recording District"  
-  tour: { x: 2, y: -4 },         // Northeast - "Performance District"
+  studio: { x: 4, y: 2 },       // Southeast - "Recording District"
+  tour: { x: 2, y: -4 },        // Northeast - "Performance District"
 };
 
 // Calculate artist position based on connection type weights
@@ -21,28 +61,38 @@ function calculateHubPosition(artistData) {
   }
 
   // Count connection types
-  const weights = { member: 0, studio: 0, tour: 0 };
+  const weights = { member: 0, studio: 0, writing: 0, label: 0 };
   artistData.relations.forEach(rel => {
-    const type = rel.type === 'member of band' ? 'member' : 
-                 rel.type === 'collaboration' ? 'studio' : 
-                 rel.type === 'performance' ? 'tour' : null;
+    const type = rel.type === 'member of band' ? 'member' :
+                 rel.type === 'collaboration' || rel.type === 'production' ? 'studio' :
+                 rel.type === 'writer' || rel.type === 'composer' || rel.type === 'lyricist' || rel.type === 'songwriter' ? 'writing' :
+                 rel.label ? 'label' : null;  // Any relationship with a label entity
     if (type) weights[type]++;
   });
 
-  const total = weights.member + weights.studio + weights.tour;
+  const total = weights.member + weights.studio + weights.writing + weights.label;
   if (total === 0) return { x: 0, y: 0 };
+
+  // Extended hub positions for new types
+  const hubs = {
+    ...HUBS,
+    writing: { x: -4, y: 3 },   // Southwest - "Songwriting District"
+    label: { x: 5, y: -3 }      // East - "Business District"
+  };
 
   // Weighted average of hub positions
   const x = (
-    (weights.member / total) * HUBS.personnel.x +
-    (weights.studio / total) * HUBS.studio.x +
-    (weights.tour / total) * HUBS.tour.x
+    (weights.member / total) * hubs.personnel.x +
+    (weights.studio / total) * hubs.studio.x +
+    (weights.writing / total) * hubs.writing.x +
+    (weights.label / total) * hubs.label.x
   );
-  
+
   const y = (
-    (weights.member / total) * HUBS.personnel.y +
-    (weights.studio / total) * HUBS.studio.y +
-    (weights.tour / total) * HUBS.tour.y
+    (weights.member / total) * hubs.personnel.y +
+    (weights.studio / total) * hubs.studio.y +
+    (weights.writing / total) * hubs.writing.y +
+    (weights.label / total) * hubs.label.y
   );
 
   // Snap to grid (round to nearest integer)
@@ -52,13 +102,22 @@ function calculateHubPosition(artistData) {
   };
 }
 
-// REAL MUSICBRAINZ API
+// ============================================================================
+// 2. API FUNCTIONS
+// MusicBrainz and Wikidata API calls with rate limiting
+// ============================================================================
+
+/** MusicBrainz API base URL */
 const MUSICBRAINZ_API = 'https://musicbrainz.org/ws/2';
 const APP_NAME = 'Counterpoint';
 const APP_VERSION = '1.0.0';
 const CONTACT = 'your-email@example.com'; // Replace with your email
 
-// Rate limiting - MusicBrainz requires 1 request per second
+/**
+ * Rate-limited fetch for MusicBrainz API (1 request/sec required)
+ * @param {string} url - The URL to fetch
+ * @returns {Promise<Object>} Parsed JSON response
+ */
 let lastRequestTime = 0;
 async function rateLimitedFetch(url) {
   const now = Date.now();
@@ -81,7 +140,11 @@ async function rateLimitedFetch(url) {
   return response.json();
 }
 
-// Search for artists
+/**
+ * Search for artists in MusicBrainz
+ * @param {string} query - Search query
+ * @returns {Promise<Array>} Array of artist objects
+ */
 async function searchMusicBrainzArtist(query) {
   const encodedQuery = encodeURIComponent(query);
   const url = `${MUSICBRAINZ_API}/artist?query=${encodedQuery}&fmt=json&limit=10`;
@@ -89,14 +152,79 @@ async function searchMusicBrainzArtist(query) {
   return data.artists || [];
 }
 
-// Get artist details with relationships
+/**
+ * Get full artist details from MusicBrainz by MBID
+ * @param {string} mbid - MusicBrainz ID
+ * @returns {Promise<Object>} Artist details with relationships
+ */
 async function getArtistDetails(mbid) {
-  const url = `${MUSICBRAINZ_API}/artist/${mbid}?inc=artist-rels+recording-rels+work-rels+url-rels+genres+tags&fmt=json`;
+  const url = `${MUSICBRAINZ_API}/artist/${mbid}?inc=artist-rels+recording-rels+work-rels+label-rels+url-rels+genres+tags&fmt=json`;
   return await rateLimitedFetch(url);
 }
 
-// --- GEOMETRY & PATHING UTILITIES ---
+/**
+ * Extract Wikidata ID from artist's URL relationships
+ * @param {Object} artistData - Artist data from MusicBrainz
+ * @returns {string|null} Wikidata ID (e.g., "Q2831") or null if not found
+ */
+function extractWikidataId(artistData) {
+  if (!artistData.relations) return null;
 
+  for (const rel of artistData.relations) {
+    if (rel.type === 'wikidata' && rel.url?.resource) {
+      // URL format: https://www.wikidata.org/wiki/Q2831
+      const match = rel.url.resource.match(/wikidata\.org\/wiki\/(Q\d+)/);
+      if (match) return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Fetch artist image URL from Wikidata
+ * @param {string} wikidataId - Wikidata entity ID (e.g., "Q2831")
+ * @returns {Promise<string|null>} Image URL or null if not found
+ */
+async function fetchWikidataImage(wikidataId) {
+  if (!wikidataId) return null;
+
+  try {
+    const url = `https://www.wikidata.org/wiki/Special:EntityData/${wikidataId}.json`;
+    const response = await fetch(url);
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const entity = data.entities[wikidataId];
+
+    // P18 is the property for "image"
+    const imageClaim = entity?.claims?.P18?.[0];
+    if (!imageClaim) return null;
+
+    const imageName = imageClaim.mainsnak?.datavalue?.value;
+    if (!imageName) return null;
+
+    // Convert filename to Wikimedia Commons URL
+    const encodedName = encodeURIComponent(imageName.replace(/ /g, '_'));
+    // Use Wikimedia's thumbnail API for a reasonable size
+    const imageUrl = `https://commons.wikimedia.org/wiki/Special:FilePath/${encodedName}?width=300`;
+
+    return imageUrl;
+  } catch (err) {
+    console.error('Failed to fetch Wikidata image:', err);
+    return null;
+  }
+}
+
+// ============================================================================
+// 3. GEOMETRY & PATHING UTILITIES
+// SVG path generation, grid calculations, and connection bundling
+// ============================================================================
+
+/**
+ * Bundle connections between the same two artists for parallel line rendering
+ * @param {Array} connections - Array of connection objects
+ * @returns {Object} Bundles keyed by sorted artist pair
+ */
 function getBundledConnections(connections) {
   const bundles = {};
   connections.forEach(conn => {
@@ -107,11 +235,28 @@ function getBundledConnections(connections) {
   return bundles;
 }
 
+/**
+ * Calculate offset for a bundled connection line
+ * @param {number} index - Index of this connection in the bundle
+ * @param {number} total - Total connections in the bundle
+ * @param {number} gap - Gap between parallel lines
+ * @returns {number} Pixel offset from center
+ */
 function getBundleOffset(index, total, gap = LINE_GAP) {
   if (total === 1) return 0;
   return (index - (total - 1) / 2) * gap;
 }
 
+/**
+ * Generate an SVG path string for an octilinear (metro-style) line
+ * Uses only horizontal, vertical, and 45-degree diagonal segments
+ * @param {number} x1 - Start X coordinate
+ * @param {number} y1 - Start Y coordinate
+ * @param {number} x2 - End X coordinate
+ * @param {number} y2 - End Y coordinate
+ * @param {number} offset - Perpendicular offset for bundled lines
+ * @returns {string} SVG path string
+ */
 function generateOctilinearPath(x1, y1, x2, y2, offset) {
   const dx = x2 - x1;
   const dy = y2 - y1;
@@ -172,7 +317,11 @@ function generateOctilinearPath(x1, y1, x2, y2, offset) {
   }
 }
 
-// Calculate path length for SVG path
+/**
+ * Get the length of an SVG path string (in pixels)
+ * @param {string} pathString - SVG path d attribute
+ * @returns {number} Path length in pixels
+ */
 function getPathLength(pathString) {
   const tempSvg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   const tempPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
@@ -184,7 +333,16 @@ function getPathLength(pathString) {
   return length;
 }
 
-// Helper functions for data processing
+// ============================================================================
+// 4. DATA PROCESSING
+// Functions to extract and process artist data from API responses
+// ============================================================================
+
+/**
+ * Search for real artists using MusicBrainz API (wrapper with error handling)
+ * @param {string} query - Search string
+ * @returns {Promise<Array>} Array of simplified artist objects
+ */
 async function searchRealArtist(query) {
   try {
     const results = await searchMusicBrainzArtist(query);
@@ -201,6 +359,11 @@ async function searchRealArtist(query) {
   }
 }
 
+/**
+ * Get full artist details by MBID (wrapper with error handling)
+ * @param {string} mbid - MusicBrainz ID
+ * @returns {Promise<Object>} Artist details
+ */
 async function getRealArtistDetails(mbid) {
   try {
     return await getArtistDetails(mbid);
@@ -210,6 +373,11 @@ async function getRealArtistDetails(mbid) {
   }
 }
 
+/**
+ * Extract genres from artist object (combines genres and tags)
+ * @param {Object} artist - Artist data from MusicBrainz
+ * @returns {string} Comma-separated genres (max 2)
+ */
 function extractGenres(artist) {
   const genres = new Set();
   
@@ -223,6 +391,11 @@ function extractGenres(artist) {
   return Array.from(genres).slice(0, 2).join(', ') || 'Unknown';
 }
 
+/**
+ * Get the year (YYYY) from artist's life-span
+ * @param {Object} artist - Artist data from MusicBrainz
+ * @returns {number|null} Year or null if not available
+ */
 function getArtistYear(artist) {
   if (artist['life-span'] && artist['life-span'].begin) {
     return parseInt(artist['life-span'].begin.split('-')[0]);
@@ -230,13 +403,135 @@ function getArtistYear(artist) {
   return null;
 }
 
+/**
+ * Extract works (songs) an artist has written/composed/lyricized
+ * @param {Object} artistData - Artist data from MusicBrainz
+ * @returns {Array} Array of work objects with id, title, role
+ */
+function extractWrittenWorks(artistData) {
+  const works = [];
+  if (!artistData.relations) return works;
+
+  artistData.relations.forEach(rel => {
+    // Work relationships - artist wrote/composed a work
+    if (rel.work && (rel.type === 'writer' || rel.type === 'composer' || rel.type === 'lyricist')) {
+      works.push({
+        id: rel.work.id,
+        title: rel.work.title,
+        role: rel.type
+      });
+    }
+  });
+
+  return works;
+}
+
+/**
+ * Extract record labels an artist has been signed to
+ * @param {Object} artistData - Artist data from MusicBrainz
+ * @returns {Array} Array of label objects with id, name, type, years
+ */
+function extractLabels(artistData) {
+  const labels = [];
+  if (!artistData.relations) return labels;
+
+  artistData.relations.forEach(rel => {
+    if (rel.label) {
+      labels.push({
+        id: rel.label.id,
+        name: rel.label.name,
+        type: rel.type,
+        years: rel.begin ? (rel.end ? `${rel.begin}-${rel.end}` : `${rel.begin}-`) : ''
+      });
+    }
+  });
+
+  return labels;
+}
+
+/**
+ * Find artists who share the same record label (labelmates)
+ * @param {string} newArtistId - MBID of the new artist
+ * @param {Array} newArtistLabels - Labels the new artist is signed to
+ * @param {Object} existingArtists - Existing artists on the map
+ * @returns {Array} Array of label connection objects
+ */
+function findSharedLabels(newArtistId, newArtistLabels, existingArtists) {
+  const connections = [];
+  if (newArtistLabels.length === 0) return connections;
+
+  Object.values(existingArtists).forEach(existingArtist => {
+    if (!existingArtist.labels || existingArtist.id === newArtistId) return;
+
+    const sharedLabels = newArtistLabels.filter(newLabel =>
+      existingArtist.labels.some(existingLabel => existingLabel.id === newLabel.id)
+    );
+
+    if (sharedLabels.length > 0) {
+      connections.push({
+        from: newArtistId,
+        to: existingArtist.id,
+        type: 'label',
+        data: {
+          role: 'Labelmates',
+          years: '',
+          titles: sharedLabels.map(l => l.name)
+        }
+      });
+    }
+  });
+
+  return connections;
+}
+
+/**
+ * Find co-writers between a new artist and existing artists
+ * @param {string} newArtistId - MBID of the new artist
+ * @param {Array} newArtistWorks - Works the new artist has written
+ * @param {Object} existingArtists - Existing artists on the map
+ * @returns {Array} Array of writing connection objects
+ */
+function findCoWriters(newArtistId, newArtistWorks, existingArtists) {
+  const connections = [];
+
+  Object.values(existingArtists).forEach(existingArtist => {
+    if (!existingArtist.works || existingArtist.id === newArtistId) return;
+
+    // Find shared works
+    const sharedWorks = newArtistWorks.filter(newWork =>
+      existingArtist.works.some(existingWork => existingWork.id === newWork.id)
+    );
+
+    if (sharedWorks.length > 0) {
+      connections.push({
+        from: newArtistId,
+        to: existingArtist.id,
+        type: 'writing',
+        data: {
+          role: 'Co-Writer',
+          years: '',
+          titles: sharedWorks.map(w => w.title)
+        }
+      });
+    }
+  });
+
+  return connections;
+}
+
+/**
+ * Process MusicBrainz relationships into app connection objects
+ * Extracts member, studio, and writing relationships
+ * @param {Object} artistData - Artist data from MusicBrainz
+ * @returns {Array} Array of connection objects with type, targetMbid, targetName, data
+ */
 function processRelationships(artistData) {
   const connections = [];
-  
+
   if (!artistData.relations) return connections;
-  
+
   artistData.relations.forEach(rel => {
-    // Only process artist-to-artist relationships
+    // --- Member of band relationships ---
     if (rel.type === 'member of band' && rel.artist) {
       connections.push({
         type: 'member',
@@ -244,14 +539,14 @@ function processRelationships(artistData) {
         targetName: rel.artist.name,
         data: {
           role: rel.attributes?.join(', ') || 'Member',
-          years: rel.begin && rel.end 
+          years: rel.begin && rel.end
             ? `${rel.begin}-${rel.end}`
             : rel.begin ? rel.begin : 'Unknown',
           titles: rel.title ? [rel.title] : null
         }
       });
     }
-    
+
     // Check for other collaboration types
     if ((rel.type === 'collaboration' || rel.type === 'production') && rel.artist) {
       connections.push({
@@ -265,83 +560,171 @@ function processRelationships(artistData) {
         }
       });
     }
-    
-    if (rel.type === 'performance' && rel.artist) {
+
+    // Direct artist-to-artist writing credits (rare but possible)
+    if ((rel.type === 'writer' || rel.type === 'composer' || rel.type === 'lyricist' || rel.type === 'songwriter') && rel.artist) {
       connections.push({
-        type: 'tour',
+        type: 'writing',
         targetMbid: rel.artist.id,
         targetName: rel.artist.name,
         data: {
-          event: 'Live Performance',
-          date: rel.begin || 'Unknown',
+          role: rel.type.charAt(0).toUpperCase() + rel.type.slice(1),
+          years: rel.begin ? rel.begin : 'Unknown',
           titles: rel.title ? [rel.title] : null
         }
       });
     }
+
+    // Label connections are handled separately via findSharedLabels
   });
-  
+
   return connections;
 }
 
+
+// ============================================================================
+// 5. LAYOUT
+// Auto-positioning of artists on the transit map grid
+// ============================================================================
+
+/**
+ * Auto-layout artists in a spiral pattern from center
+ * Creates a transit-map-style layout that spreads horizontally
+ * @param {Object} artists - Object of artist data keyed by MBID
+ * @returns {Object} Artists with x, y positions assigned
+ */
 function autoLayoutStations(artists) {
   const positioned = {};
   const artistList = Object.values(artists);
-  
-  const byDecade = {};
-  artistList.forEach(artist => {
-    const year = artist.year || 1970;
-    const decade = Math.floor(year / 10) * 10;
-    if (!byDecade[decade]) byDecade[decade] = [];
-    byDecade[decade].push(artist);
+
+  if (artistList.length === 0) return positioned;
+
+  // Sort by year for consistent ordering
+  artistList.sort((a, b) => (a.year || 1970) - (b.year || 1970));
+
+  // Spiral outward from center - transit map style
+  // Uses a rectangular spiral that spreads wide horizontally
+  const occupied = new Set();
+  const getKey = (x, y) => `${x},${y}`;
+
+  // Spiral directions: right, down, left, up - but weighted to go wider
+  const directions = [
+    { dx: 2, dy: 0 },   // right (2 steps for wider spread)
+    { dx: 0, dy: 1 },   // down
+    { dx: -2, dy: 0 },  // left (2 steps for wider spread)
+    { dx: 0, dy: -1 }   // up
+  ];
+
+  let x = 0, y = 0;
+  let dirIndex = 0;
+  let stepsInDir = 0;
+  let stepsBeforeTurn = 1;
+  let turnCount = 0;
+
+  artistList.forEach((artist, idx) => {
+    // Find next unoccupied position
+    while (occupied.has(getKey(x, y))) {
+      const dir = directions[dirIndex];
+      x += dir.dx;
+      y += dir.dy;
+      stepsInDir++;
+
+      if (stepsInDir >= stepsBeforeTurn) {
+        stepsInDir = 0;
+        dirIndex = (dirIndex + 1) % 4;
+        turnCount++;
+        // Increase steps every 2 turns (completed one "ring")
+        if (turnCount % 2 === 0) {
+          stepsBeforeTurn++;
+        }
+      }
+    }
+
+    positioned[artist.id] = {
+      ...artist,
+      x: x,
+      y: y
+    };
+    occupied.add(getKey(x, y));
+
+    // Move to next position for next artist
+    const dir = directions[dirIndex];
+    x += dir.dx;
+    y += dir.dy;
+    stepsInDir++;
+
+    if (stepsInDir >= stepsBeforeTurn) {
+      stepsInDir = 0;
+      dirIndex = (dirIndex + 1) % 4;
+      turnCount++;
+      if (turnCount % 2 === 0) {
+        stepsBeforeTurn++;
+      }
+    }
   });
-  
-  let y = 1;
-  Object.keys(byDecade).sort().forEach(decade => {
-    const artistsInDecade = byDecade[decade];
-    artistsInDecade.forEach((artist, idx) => {
-      positioned[artist.id] = {
-        ...artist,
-        x: (idx % 6) + 1,
-        y: y + Math.floor(idx / 6)
-      };
-    });
-    y += Math.ceil(artistsInDecade.length / 6) + 1;
-  });
-  
+
   return positioned;
 }
 
+
+// ============================================================================
+// COLOR & LABEL CONSTANTS
+// Theme colors and human-readable labels for connection types
+// ============================================================================
+
+/** Line colors for light mode */
 const LINE_COLORS_LIGHT = {
-  member: '#059669',
-  studio: '#2563eb',
-  tour: '#dc2626',
+  member: '#059669',   // Emerald - Personnel/Band membership
+  studio: '#2563eb',   // Blue - Studio collaborations
+  writing: '#7c3aed',  // Purple - Writing credits
+  label: '#ca8a04',    // Yellow - Record label
+  error: '#dc2626',    // Red - UI elements (errors, clear buttons)
 };
 
+/** Line colors for dark mode */
 const LINE_COLORS_DARK = {
-  member: '#10b981',
-  studio: '#3b82f6',
-  tour: '#ef4444',
+  member: '#10b981',   // Emerald (lighter)
+  studio: '#3b82f6',   // Blue (lighter)
+  writing: '#a78bfa',  // Purple (lighter)
+  label: '#facc15',    // Yellow (lighter)
+  error: '#ef4444',    // Red (lighter)
 };
 
+/** Human-readable labels for each connection type */
 const LINE_LABELS = {
   member: 'Personnel Line',
   studio: 'Studio Line',
-  tour: 'Live Wire',
+  writing: 'Writing Credits',
+  label: 'Record Label',
 };
 
-// Global offset for each line type to prevent crossing overlap
+/** Perpendicular offset for each line type to prevent overlap */
 const LINE_TYPE_OFFSET = {
-  member: 0,        // Green - center line
-  studio: LINE_GAP, // Blue - offset to one side
-  tour: -LINE_GAP,  // Red - offset to opposite side
+  member: 0,              // Green - center line
+  studio: LINE_GAP,       // Blue - offset to one side
+  writing: -LINE_GAP,     // Purple - offset to opposite side
+  label: LINE_GAP * 1.5,  // Yellow - further offset
 };
 
+/**
+ * Convert grid coordinates to pixel coordinates for SVG rendering
+ * @param {number} gridX - Grid X position
+ * @param {number} gridY - Grid Y position
+ * @returns {{x: number, y: number}} Pixel coordinates
+ */
 const gridToPixel = (gridX, gridY) => ({
   x: gridX * GRID_SIZE,
   y: gridY * GRID_SIZE
 });
 
-// Find shortest path between two stations
+/**
+ * Find the shortest path between two artists using DFS
+ * @param {Object} graph - Graph with artists and connections
+ * @param {string} startId - Starting artist MBID
+ * @param {string} endId - Ending artist MBID
+ * @param {number} maxDepth - Maximum path length to search
+ * @returns {Array|null} Shortest path as array of steps, or null if none found
+ */
 function findAllPaths(graph, startId, endId, maxDepth = 6) {
   if (!startId || !endId || startId === endId) return null;
   
@@ -383,26 +766,55 @@ function findAllPaths(graph, startId, endId, maxDepth = 6) {
   return allPaths[0];
 }
 
+
+// ============================================================================
+// 6. MAIN COMPONENT
+// React component with state management, event handlers, and UI rendering
+// ============================================================================
+
 export default function Counterpoint() {
+  // ────────────────────────────────────────────────────────────────
+  // 6.1 STATE: All useState/useRef hooks
+  // ────────────────────────────────────────────────────────────────
+
+  // UI theme
   const [darkMode, setDarkMode] = useState(true);
+
+  // Main graph data: artists and their connections
   const [graph, setGraph] = useState({ artists: {}, connections: [] });
-  const [selectedStation, setSelectedStation] = useState(null);
-  const [hoveredStation, setHoveredStation] = useState(null);
-  const [selectedConnection, setSelectedConnection] = useState(null);
+
+  // Selection state
+  const [selectedStation, setSelectedStation] = useState(null);   // Selected artist
+  const [hoveredStation, setHoveredStation] = useState(null);     // Hovered artist
+  const [selectedConnection, setSelectedConnection] = useState(null); // Selected line
+
+  // Route-finding state
   const [startStation, setStartStation] = useState(null);
   const [endStation, setEndStation] = useState(null);
   const [route, setRoute] = useState(null);
+
+  // Search state
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState([]);
   const [isSearching, setIsSearching] = useState(false);
   const [error, setError] = useState(null);
+
+  // Loading state
   const [loadingArtists, setLoadingArtists] = useState(new Set());
+  const [isExploring, setIsExploring] = useState(false);
+
+  // UI visibility
   const [showSearch, setShowSearch] = useState(true);
-  
+
+  // SVG viewport and panning
   const svgRef = useRef(null);
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, width: 800, height: 600 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+
+  // ────────────────────────────────────────────────────────────────
+  // 6.2 DERIVED VALUES: Theme colors and memoized calculations
+  // ────────────────────────────────────────────────────────────────
 
   const LINE_COLORS = darkMode ? LINE_COLORS_DARK : LINE_COLORS_LIGHT;
   const backgroundColor = darkMode ? '#000000' : '#ffffff';
@@ -410,11 +822,19 @@ export default function Counterpoint() {
   const mutedText = darkMode ? '#9ca3af' : '#6b7280';
   const borderColor = darkMode ? '#333333' : '#e5e7eb';
 
-  // Bundle connections for parallel line calculation
+  // Bundle connections for parallel line calculation (memoized)
   const bundledConnections = useMemo(() => {
     return getBundledConnections(graph.connections);
   }, [graph.connections]);
 
+  // ────────────────────────────────────────────────────────────────
+  // 6.3 HANDLERS: Search, add artist, explore connections
+  // ────────────────────────────────────────────────────────────────
+
+  /**
+   * Search for artists using MusicBrainz API
+   * Updates searchResults state with matching artists
+   */
   const handleSearch = async () => {
   if (!searchQuery.trim()) return;
   
@@ -432,39 +852,54 @@ export default function Counterpoint() {
   }
 };
 
+  /**
+   * Add an artist to the graph by MBID
+   * Fetches artist details, processes relationships, and creates connections
+   * @param {string} mbid - MusicBrainz ID
+   * @param {string} name - Artist name (for display during loading)
+   */
   const addArtistToGraph = async (mbid, name) => {
     if (graph.artists[mbid]) {
       setError('Artist already added to the map');
       return;
     }
-    
+
     setLoadingArtists(prev => new Set(prev).add(mbid));
     setError(null);
-    
+
     try {
       const artistData = await getRealArtistDetails(mbid);
       if (!artistData) {
         setError('Artist not found');
         return;
       }
-      
+
       const year = getArtistYear(artistData);
       const genres = extractGenres(artistData);
-      
+      const works = extractWrittenWorks(artistData);
+      const labels = extractLabels(artistData);
+
+      // Fetch artist image from Wikidata
+      const wikidataId = extractWikidataId(artistData);
+      const imageUrl = await fetchWikidataImage(wikidataId);
+
       const hubPosition = calculateHubPosition(artistData);
-      
+
       const newArtist = {
         id: mbid,
         name: artistData.name,
         type: artistData.type || 'artist',
         year: year,
         genre: genres,
+        works: works,
+        labels: labels,
+        imageUrl: imageUrl,
         x: hubPosition.x,
         y: hubPosition.y
       };
-      
+
       const connections = processRelationships(artistData);
-      
+
       const newConnections = [];
       connections.forEach(conn => {
         if (graph.artists[conn.targetMbid]) {
@@ -476,22 +911,30 @@ export default function Counterpoint() {
           });
         }
       });
-      
+
+      // Find co-writers based on shared works
+      const coWriterConnections = findCoWriters(mbid, works, graph.artists);
+      newConnections.push(...coWriterConnections);
+
+      // Find labelmates based on shared labels
+      const labelConnections = findSharedLabels(mbid, labels, graph.artists);
+      newConnections.push(...labelConnections);
+
       const updatedArtists = {
         ...graph.artists,
         [mbid]: newArtist
       };
-      
+
       const layouted = autoLayoutStations(updatedArtists);
-      
+
       setGraph({
         artists: layouted,
         connections: [...graph.connections, ...newConnections]
       });
-      
+
       setSearchQuery('');
       setSearchResults([]);
-      
+
     } catch (err) {
       setError('Failed to add artist. Please try again.');
       console.error(err);
@@ -504,37 +947,56 @@ export default function Counterpoint() {
     }
   };
 
+  /**
+   * Explore connections from an existing artist on the map
+   * Fetches related artists and adds them with their connections
+   * @param {string} mbid - MusicBrainz ID of the artist to explore from
+   */
   const exploreConnections = async (mbid) => {
-    if (!graph.artists[mbid]) return;
-    
+    if (!graph.artists[mbid] || isExploring) return;
+
+    setIsExploring(true);
     setLoadingArtists(prev => new Set(prev).add(mbid));
     setError(null);
-    
+
     try {
       const artistData = await getRealArtistDetails(mbid);
       if (!artistData) return;
-      
+
+      // Update current artist's works and labels
+      const currentWorks = extractWrittenWorks(artistData);
+      const currentLabels = extractLabels(artistData);
+
       const connections = processRelationships(artistData);
-      
+
       const newArtists = {};
       const newConnections = [];
-      
+
       for (const conn of connections) {
-        if (!graph.artists[conn.targetMbid]) {
+        if (!graph.artists[conn.targetMbid] && !newArtists[conn.targetMbid]) {
           try {
             const relatedData = await getRealArtistDetails(conn.targetMbid);
             if (!relatedData) continue;
-            
+
             const year = getArtistYear(relatedData);
             const genres = extractGenres(relatedData);
+            const works = extractWrittenWorks(relatedData);
+            const labels = extractLabels(relatedData);
             const hubPosition = calculateHubPosition(relatedData);
-            
+
+            // Fetch artist image from Wikidata
+            const wikidataId = extractWikidataId(relatedData);
+            const imageUrl = await fetchWikidataImage(wikidataId);
+
             newArtists[conn.targetMbid] = {
               id: conn.targetMbid,
               name: conn.targetName,
               type: relatedData.type || 'artist',
               year: year,
               genre: genres,
+              works: works,
+              labels: labels,
+              imageUrl: imageUrl,
               x: hubPosition.x,
               y: hubPosition.y
             };
@@ -543,12 +1005,15 @@ export default function Counterpoint() {
             continue;
           }
         }
-        
+
         const isDuplicate = graph.connections.some(
           c => (c.from === mbid && c.to === conn.targetMbid) ||
                (c.from === conn.targetMbid && c.to === mbid)
+        ) || newConnections.some(
+          c => (c.from === mbid && c.to === conn.targetMbid) ||
+               (c.from === conn.targetMbid && c.to === mbid)
         );
-        
+
         if (!isDuplicate) {
           newConnections.push({
             from: mbid,
@@ -558,23 +1023,79 @@ export default function Counterpoint() {
           });
         }
       }
-      
-      const updatedArtists = {
+
+      // Merge existing artists with new ones for co-writer/labelmate search
+      const allArtists = {
         ...graph.artists,
         ...newArtists
       };
-      
-      const layouted = autoLayoutStations(updatedArtists);
-      
+
+      // Update current artist with works and labels
+      allArtists[mbid] = {
+        ...allArtists[mbid],
+        works: currentWorks,
+        labels: currentLabels
+      };
+
+      // Helper to check for duplicate connections
+      const isDuplicateConn = (conn, type) => {
+        return graph.connections.some(
+          c => (c.from === conn.from && c.to === conn.to && c.type === type) ||
+               (c.from === conn.to && c.to === conn.from && c.type === type)
+        ) || newConnections.some(
+          c => (c.from === conn.from && c.to === conn.to && c.type === type) ||
+               (c.from === conn.to && c.to === conn.from && c.type === type)
+        );
+      };
+
+      // Find co-writers for current artist
+      const coWriterConnections = findCoWriters(mbid, currentWorks, allArtists);
+      coWriterConnections.forEach(conn => {
+        if (!isDuplicateConn(conn, 'writing')) {
+          newConnections.push(conn);
+        }
+      });
+
+      // Find labelmates for current artist
+      const labelConnections = findSharedLabels(mbid, currentLabels, allArtists);
+      labelConnections.forEach(conn => {
+        if (!isDuplicateConn(conn, 'label')) {
+          newConnections.push(conn);
+        }
+      });
+
+      // Also find co-writers and labelmates for each new artist
+      Object.values(newArtists).forEach(newArtist => {
+        if (newArtist.works && newArtist.works.length > 0) {
+          const artistCoWriters = findCoWriters(newArtist.id, newArtist.works, allArtists);
+          artistCoWriters.forEach(conn => {
+            if (!isDuplicateConn(conn, 'writing')) {
+              newConnections.push(conn);
+            }
+          });
+        }
+        if (newArtist.labels && newArtist.labels.length > 0) {
+          const artistLabelmates = findSharedLabels(newArtist.id, newArtist.labels, allArtists);
+          artistLabelmates.forEach(conn => {
+            if (!isDuplicateConn(conn, 'label')) {
+              newConnections.push(conn);
+            }
+          });
+        }
+      });
+
+      const layouted = autoLayoutStations(allArtists);
+
       setGraph({
         artists: layouted,
         connections: [...graph.connections, ...newConnections]
       });
-      
+
     } catch (err) {
       setError('Failed to explore connections. Please try again.');
       console.error(err);
     } finally {
+      setIsExploring(false);
       setLoadingArtists(prev => {
         const next = new Set(prev);
         next.delete(mbid);
@@ -583,7 +1104,11 @@ export default function Counterpoint() {
     }
   };
 
-  // Calculate route when start/end stations change
+  // ────────────────────────────────────────────────────────────────
+  // 6.4 EFFECTS: Route calculation
+  // ────────────────────────────────────────────────────────────────
+
+  /** Calculate route when start/end stations change */
   useEffect(() => {
     if (startStation && endStation && startStation !== endStation) {
       const path = findAllPaths(graph, startStation, endStation);
@@ -593,6 +1118,11 @@ export default function Counterpoint() {
     }
   }, [startStation, endStation, graph]);
 
+  // ────────────────────────────────────────────────────────────────
+  // 6.5 PAN & ZOOM HANDLERS: Mouse events for map navigation
+  // ────────────────────────────────────────────────────────────────
+
+  /** Handle mouse down for panning */
   const handleMouseDown = (e) => {
     if (e.button === 0) {
       setIsPanning(true);
@@ -600,6 +1130,7 @@ export default function Counterpoint() {
     }
   };
 
+  /** Handle mouse move for panning */
   const handleMouseMove = (e) => {
     if (isPanning) {
       const dx = (e.clientX - panStart.x) * 1.5;
@@ -613,10 +1144,12 @@ export default function Counterpoint() {
     }
   };
 
+  /** Handle mouse up to stop panning */
   const handleMouseUp = () => {
     setIsPanning(false);
   };
 
+  /** Handle mouse wheel for zooming */
   const handleWheel = (e) => {
     e.preventDefault();
     const delta = e.deltaY > 0 ? 1.1 : 0.9;
@@ -636,8 +1169,11 @@ export default function Counterpoint() {
     });
   };
 
-  // Check if connection is in route
-  // Check if connection is in route
+  // ────────────────────────────────────────────────────────────────
+  // 6.6 HELPER FUNCTIONS: Route checking
+  // ────────────────────────────────────────────────────────────────
+
+  /** Check if a connection is part of the current route */
   const isConnectionInRoute = (conn) => {
     if (!route) return false;
     return route.some(step => 
@@ -645,6 +1181,10 @@ export default function Counterpoint() {
       (step.conn.from === conn.to && step.conn.to === conn.from)
     );
   };
+
+  // ────────────────────────────────────────────────────────────────
+  // 6.7 RENDER: Main component JSX
+  // ────────────────────────────────────────────────────────────────
 
   return (
     <div style={{
@@ -721,13 +1261,13 @@ export default function Counterpoint() {
             <div style={{
               padding: '12px',
               background: darkMode ? '#1a0000' : '#fef2f2',
-              border: `2px solid ${LINE_COLORS.tour}`,
+              border: `2px solid ${LINE_COLORS.error}`,
               borderRadius: '4px',
               fontSize: '12px',
               display: 'flex',
               alignItems: 'center',
               gap: '8px',
-              color: LINE_COLORS.tour
+              color: LINE_COLORS.error
             }}>
               <AlertCircle size={16} />
               {error}
@@ -767,9 +1307,34 @@ export default function Counterpoint() {
         </div>
 
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
-          <h3 style={{ fontSize: '12px', fontWeight: 'bold', marginBottom: '12px' }}>
-            ON MAP ({Object.keys(graph.artists).length})
-          </h3>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
+            <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: 0 }}>
+              ON MAP ({Object.keys(graph.artists).length})
+            </h3>
+            {Object.keys(graph.artists).length > 0 && (
+              <button
+                onClick={() => {
+                  setGraph({ artists: {}, connections: [] });
+                  setSelectedStation(null);
+                  setStartStation(null);
+                  setEndStation(null);
+                  setRoute(null);
+                }}
+                style={{
+                  padding: '4px 8px',
+                  fontSize: '10px',
+                  background: 'transparent',
+                  color: LINE_COLORS.error,
+                  border: `1px solid ${LINE_COLORS.error}`,
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  fontWeight: 'bold'
+                }}
+              >
+                RESET
+              </button>
+            )}
+          </div>
           <div style={{ 
             display: 'flex', 
             flexDirection: 'column', 
@@ -793,7 +1358,7 @@ export default function Counterpoint() {
                 background: ${darkMode ? '#555555' : '#555555'};
               }
             `}</style>
-            {Object.values(graph.artists).map(artist => (
+            {Object.values(graph.artists).sort((a, b) => a.name.localeCompare(b.name)).map(artist => (
               <div
                 key={artist.id}
                 onClick={() => setSelectedStation(artist)}
@@ -856,6 +1421,51 @@ export default function Counterpoint() {
         >
           {showSearch ? <X size={20} /> : <Search size={20} />}
         </button>
+
+        {/* Exploring Connections Overlay */}
+        {isExploring && (
+          <div style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: darkMode ? 'rgba(0,0,0,0.7)' : 'rgba(255,255,255,0.7)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 100,
+            backdropFilter: 'blur(2px)'
+          }}>
+            <div style={{
+              background: darkMode ? '#1a1a1a' : '#ffffff',
+              border: `2px solid ${LINE_COLORS.studio}`,
+              borderRadius: '8px',
+              padding: '24px 32px',
+              display: 'flex',
+              alignItems: 'center',
+              gap: '16px',
+              boxShadow: '0 4px 20px rgba(0,0,0,0.3)'
+            }}>
+              <Loader size={24} style={{ color: LINE_COLORS.studio, animation: 'spin 1s linear infinite' }} />
+              <div>
+                <div style={{ fontSize: '16px', fontWeight: 'bold', marginBottom: '4px' }}>
+                  Exploring Connections
+                </div>
+                <div style={{ fontSize: '12px', color: mutedText }}>
+                  Fetching related artists from MusicBrainz...
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <style>{`
+          @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+          }
+        `}</style>
 
         <div style={{
           position: 'absolute',
@@ -938,7 +1548,7 @@ export default function Counterpoint() {
               }}
               style={{
                 padding: '8px 12px',
-                background: LINE_COLORS.tour,
+                background: LINE_COLORS.error,
                 color: '#ffffff',
                 border: 'none',
                 borderRadius: '4px',
@@ -961,14 +1571,14 @@ export default function Counterpoint() {
             right: '16px',
             zIndex: 10,
             background: darkMode ? 'rgba(0,0,0,0.95)' : 'rgba(255,255,255,0.95)',
-            border: `2px solid ${LINE_COLORS.tour}`,
+            border: `2px solid ${LINE_COLORS.error}`,
             borderRadius: '4px',
             padding: '12px',
             fontSize: '11px',
             maxWidth: '280px'
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-              <AlertCircle size={16} style={{ color: LINE_COLORS.tour }} />
+              <AlertCircle size={16} style={{ color: LINE_COLORS.error }} />
               <div style={{ fontWeight: 'bold' }}>No Route Found</div>
             </div>
             <div style={{ fontSize: '10px', color: mutedText, marginBottom: '12px' }}>
@@ -995,7 +1605,7 @@ export default function Counterpoint() {
               }}
               style={{
                 padding: '8px 12px',
-                background: LINE_COLORS.tour,
+                background: LINE_COLORS.error,
                 color: '#ffffff',
                 border: 'none',
                 borderRadius: '4px',
@@ -1216,7 +1826,7 @@ export default function Counterpoint() {
             const isDimmed = selectedConnection && selectedConnection !== conn;
 
             return (
-              <g key={idx}>
+              <g key={idx} style={{ transition: 'opacity 0.3s ease' }}>
                 {/* Transparent Hit Area */}
                 <path
                   d={pathD}
@@ -1229,7 +1839,7 @@ export default function Counterpoint() {
                   }}
                   style={{ cursor: 'pointer' }}
                 />
-                
+
                 {/* Visible Line */}
                 <path
                   d={pathD}
@@ -1239,8 +1849,8 @@ export default function Counterpoint() {
                   opacity={isInRoute ? 1 : (isDimmed ? 0.2 : 0.8)}
                   strokeLinecap="round"
                   strokeLinejoin="round"
-                  style={{ 
-                    transition: 'all 0.2s ease',
+                  style={{
+                    transition: 'stroke 0.3s ease, stroke-width 0.3s ease, opacity 0.3s ease',
                     pointerEvents: 'none'
                   }}
                 />
@@ -1259,7 +1869,7 @@ export default function Counterpoint() {
             const showLabel = isSelected || isHovered;
 
             return (
-              <g key={artist.id}>
+              <g key={artist.id} style={{ transition: 'opacity 0.3s ease, transform 0.3s ease' }}>
                 {/* White outline */}
                 <circle
                   cx={pos.x}
@@ -1267,14 +1877,15 @@ export default function Counterpoint() {
                   r={STATION_RADIUS + 3}
                   fill={backgroundColor}
                   stroke="none"
+                  style={{ transition: 'all 0.3s ease' }}
                 />
                 {/* Main station circle */}
                 <circle
                   cx={pos.x}
                   cy={pos.y}
                   r={STATION_RADIUS}
-                  fill={isStart ? LINE_COLORS.member : (isEnd ? LINE_COLORS.tour : (isSelected ? '#ffffff' : backgroundColor))}
-                  stroke={isStart ? LINE_COLORS.member : (isEnd ? LINE_COLORS.tour : (isSelected ? '#ffffff' : (isInRoute ? '#ffffff' : borderColor)))}
+                  fill={isStart ? LINE_COLORS.member : (isEnd ? '#dc2626' : (isSelected ? '#ffffff' : backgroundColor))}
+                  stroke={isStart ? LINE_COLORS.member : (isEnd ? '#dc2626' : (isSelected ? '#ffffff' : (isInRoute ? '#ffffff' : borderColor)))}
                   strokeWidth={isInRoute || isStart || isEnd ? 5 : 4}
                   onClick={(e) => {
                     e.stopPropagation();
@@ -1283,7 +1894,7 @@ export default function Counterpoint() {
                   onDoubleClick={() => exploreConnections(artist.id)}
                   onMouseEnter={() => setHoveredStation(artist)}
                   onMouseLeave={() => setHoveredStation(null)}
-                  style={{ cursor: 'pointer' }}
+                  style={{ cursor: 'pointer', transition: 'all 0.3s ease' }}
                 />
                 {/* Label - only show on hover or selection */}
                 {showLabel && (
@@ -1294,7 +1905,7 @@ export default function Counterpoint() {
                     fontSize="15"
                     fontWeight="bold"
                     fill={textColor}
-                    style={{ pointerEvents: 'none', userSelect: 'none' }}
+                    style={{ pointerEvents: 'none', userSelect: 'none', transition: 'opacity 0.2s ease' }}
                   >
                     {artist.name}
                   </text>
@@ -1309,22 +1920,39 @@ export default function Counterpoint() {
             position: 'absolute',
             bottom: '16px',
             right: '16px',
-            width: '300px',
+            width: '320px',
             background: darkMode ? 'rgba(0,0,0,0.95)' : 'rgba(255,255,255,0.95)',
             border: `2px solid ${borderColor}`,
             borderRadius: '4px',
-            padding: '16px'
+            padding: '16px',
+            transition: 'all 0.3s ease'
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '12px' }}>
-              <div>
-                <h3 style={{ fontSize: '16px', fontWeight: 'bold', marginBottom: '4px' }}>
-                  {selectedStation.name}
-                </h3>
-                <div style={{ fontSize: '11px', color: mutedText }}>
-                  {selectedStation.type} • {selectedStation.genre} • {selectedStation.year}
+              <div style={{ display: 'flex', gap: '12px', alignItems: 'flex-start', flex: 1 }}>
+                {/* Artist Image */}
+                {selectedStation.imageUrl && (
+                  <img
+                    src={selectedStation.imageUrl}
+                    alt={selectedStation.name}
+                    style={{
+                      width: '60px',
+                      height: '60px',
+                      borderRadius: '4px',
+                      objectFit: 'cover',
+                      border: `2px solid ${borderColor}`
+                    }}
+                  />
+                )}
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <h3 style={{ fontSize: '16px', fontWeight: 'bold', marginBottom: '4px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {selectedStation.name}
+                  </h3>
+                  <div style={{ fontSize: '11px', color: mutedText }}>
+                    {selectedStation.type} • {selectedStation.genre} • {selectedStation.year}
+                  </div>
                 </div>
               </div>
-              <button onClick={() => setSelectedStation(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: mutedText }}>
+              <button onClick={() => setSelectedStation(null)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: mutedText, marginLeft: '8px' }}>
                 <X size={18} />
               </button>
             </div>
@@ -1351,9 +1979,9 @@ export default function Counterpoint() {
                 onClick={() => setEndStation(selectedStation.id)}
                 style={{
                   padding: '10px',
-                  background: endStation === selectedStation.id ? LINE_COLORS.tour : (darkMode ? '#1a1a1a' : '#ffffff'),
+                  background: endStation === selectedStation.id ? '#dc2626' : (darkMode ? '#1a1a1a' : '#ffffff'),
                   color: endStation === selectedStation.id ? '#ffffff' : textColor,
-                  border: `2px solid ${endStation === selectedStation.id ? LINE_COLORS.tour : borderColor}`,
+                  border: `2px solid ${endStation === selectedStation.id ? '#dc2626' : borderColor}`,
                   borderRadius: '4px',
                   cursor: 'pointer',
                   fontSize: '11px',
