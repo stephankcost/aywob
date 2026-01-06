@@ -26,8 +26,8 @@
 //
 // ============================================================================
 
-import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Music, Sun, Moon, Search, Loader, AlertCircle, Plus, X, Navigation } from 'lucide-react';
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { Music, Search, Loader, AlertCircle, Plus, X, Navigation, Trash2, Maximize, ExternalLink, Undo2, Redo2, RefreshCw } from 'lucide-react';
 
 
 // ============================================================================
@@ -111,7 +111,42 @@ function calculateHubPosition(artistData) {
 const MUSICBRAINZ_API = 'https://musicbrainz.org/ws/2';
 const APP_NAME = 'Counterpoint';
 const APP_VERSION = '1.0.0';
-const CONTACT = 'your-email@example.com'; // Replace with your email
+const CONTACT = 'counterpoint-app@example.com';
+
+/** localStorage key for persisting graph state */
+const STORAGE_KEY = 'counterpoint-graph';
+
+/**
+ * Load graph state from localStorage
+ * @returns {Object} Saved graph or default empty graph
+ */
+function loadGraphFromStorage() {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      // Validate structure
+      if (parsed.artists && parsed.connections) {
+        return parsed;
+      }
+    }
+  } catch (err) {
+    console.error('Failed to load graph from localStorage:', err);
+  }
+  return { artists: {}, connections: [] };
+}
+
+/**
+ * Save graph state to localStorage
+ * @param {Object} graph - Graph state to save
+ */
+function saveGraphToStorage(graph) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(graph));
+  } catch (err) {
+    console.error('Failed to save graph to localStorage:', err);
+  }
+}
 
 /**
  * Rate-limited fetch for MusicBrainz API (1 request/sec required)
@@ -179,6 +214,43 @@ function extractWikidataId(artistData) {
   }
   return null;
 }
+
+/**
+ * Extract streaming service URLs from artist relations
+ * @param {Object} artistData - Artist data from MusicBrainz
+ * @returns {Object} Object with spotify, appleMusic, tidal URLs (or null for each)
+ */
+function extractStreamingUrls(artistData) {
+  const urls = {
+    spotify: null,
+    appleMusic: null,
+    tidal: null
+  };
+
+  if (!artistData.relations) return urls;
+
+  for (const rel of artistData.relations) {
+    if ((rel.type === 'streaming' || rel.type === 'free streaming') && rel.url?.resource) {
+      const url = rel.url.resource;
+      if (url.includes('spotify.com') && !urls.spotify) {
+        urls.spotify = url;
+      } else if ((url.includes('music.apple.com') || url.includes('itunes.apple.com')) && !urls.appleMusic) {
+        urls.appleMusic = url;
+      } else if (url.includes('tidal.com') && !urls.tidal) {
+        urls.tidal = url;
+      }
+    }
+  }
+
+  return urls;
+}
+
+/** Streaming service brand colors and labels */
+const STREAMING_SERVICES = {
+  spotify: { label: 'Spotify', color: '#1DB954' },
+  appleMusic: { label: 'Apple Music', color: '#FA243C' },
+  tidal: { label: 'Tidal', color: '#000000' }
+};
 
 /**
  * Fetch artist image URL from Wikidata
@@ -374,6 +446,66 @@ async function getRealArtistDetails(mbid) {
 }
 
 /**
+ * Check for recording collaborations between two specific artists
+ * Uses targeted search with both artist IDs for accurate results
+ * @param {string} mbid1 - First artist MusicBrainz ID
+ * @param {string} mbid2 - Second artist MusicBrainz ID
+ * @returns {Promise<Array>} Array of shared track titles
+ */
+async function getSharedRecordings(mbid1, mbid2) {
+  try {
+    const url = `${MUSICBRAINZ_API}/recording?query=arid:${mbid1}%20AND%20arid:${mbid2}&fmt=json&limit=10`;
+
+    // rateLimitedFetch returns JSON directly, not Response object
+    const data = await rateLimitedFetch(url);
+
+    const tracks = [];
+    for (const rec of data.recordings || []) {
+      if (!tracks.includes(rec.title)) {
+        tracks.push(rec.title);
+      }
+      if (tracks.length >= 3) break;
+    }
+
+    return tracks;
+  } catch (error) {
+    console.error('Failed to check shared recordings:', error);
+    return [];
+  }
+}
+
+/**
+ * Find featured artist connections with artists already on the map
+ * @param {string} mbid - MusicBrainz artist ID of the new/refreshed artist
+ * @param {Object} existingArtists - Artists currently on the map
+ * @returns {Promise<Array>} Array of featured artist connections
+ */
+async function findFeatureConnections(mbid, existingArtists) {
+  const connections = [];
+
+  for (const [otherId, otherArtist] of Object.entries(existingArtists)) {
+    if (otherId === mbid) continue;
+
+    const sharedTracks = await getSharedRecordings(mbid, otherId);
+
+    if (sharedTracks.length > 0) {
+      connections.push({
+        type: 'feature',
+        targetMbid: otherId,
+        targetName: otherArtist.name,
+        data: {
+          role: 'Featured Artist',
+          years: '',
+          titles: sharedTracks
+        }
+      });
+    }
+  }
+
+  return connections;
+}
+
+/**
  * Extract genres from artist object (combines genres and tags)
  * @param {Object} artist - Artist data from MusicBrainz
  * @returns {string} Comma-separated genres (max 2)
@@ -548,14 +680,17 @@ function processRelationships(artistData) {
     }
 
     // Check for other collaboration types
-    if ((rel.type === 'collaboration' || rel.type === 'production') && rel.artist) {
+    if ((rel.type === 'collaboration' || rel.type === 'production' ||
+         rel.type === 'instrumental supporting musician' || rel.type === 'vocal supporting musician' ||
+         rel.type === 'supporting musician' || rel.type === 'producer' || rel.type === 'mix' ||
+         rel.type === 'remixer' || rel.type === 'conductor') && rel.artist) {
       connections.push({
         type: 'studio',
         targetMbid: rel.artist.id,
         targetName: rel.artist.name,
         data: {
-          role: 'Collaboration',
-          years: rel.begin ? rel.begin : 'Unknown',
+          role: rel.type.split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' '),
+          years: rel.begin ? rel.begin : '',
           titles: rel.title ? [rel.title] : null
         }
       });
@@ -570,6 +705,34 @@ function processRelationships(artistData) {
         data: {
           role: rel.type.charAt(0).toUpperCase() + rel.type.slice(1),
           years: rel.begin ? rel.begin : 'Unknown',
+          titles: rel.title ? [rel.title] : null
+        }
+      });
+    }
+
+    // Influence relationships
+    if (rel.type === 'influenced by' && rel.artist) {
+      connections.push({
+        type: 'influence',
+        targetMbid: rel.artist.id,
+        targetName: rel.artist.name,
+        data: {
+          role: 'Influenced by',
+          years: '',
+          titles: null
+        }
+      });
+    }
+
+    // Cover/tribute relationships
+    if ((rel.type === 'cover' || rel.type === 'tribute') && rel.artist) {
+      connections.push({
+        type: 'cover',
+        targetMbid: rel.artist.id,
+        targetName: rel.artist.name,
+        data: {
+          role: rel.type === 'cover' ? 'Covered' : 'Tribute',
+          years: '',
           titles: rel.title ? [rel.title] : null
         }
       });
@@ -678,16 +841,20 @@ const LINE_COLORS_LIGHT = {
   studio: '#2563eb',   // Blue - Studio collaborations
   writing: '#7c3aed',  // Purple - Writing credits
   label: '#ca8a04',    // Yellow - Record label
+  feature: '#ea580c',  // Orange - Featured artist
+  cover: '#dc2626',    // Red - Covered songs
   error: '#dc2626',    // Red - UI elements (errors, clear buttons)
 };
 
 /** Line colors for dark mode */
 const LINE_COLORS_DARK = {
-  member: '#10b981',   // Emerald (lighter)
-  studio: '#3b82f6',   // Blue (lighter)
-  writing: '#a78bfa',  // Purple (lighter)
-  label: '#facc15',    // Yellow (lighter)
-  error: '#ef4444',    // Red (lighter)
+  member: '#10b981',     // Emerald - Personnel/Band membership
+  studio: '#3b82f6',     // Blue - Studio collaborations
+  writing: '#a78bfa',    // Purple - Writing credits
+  label: '#facc15',      // Yellow - Record label
+  feature: '#f97316',    // Orange - Featured artist
+  cover: '#ef4444',      // Red - Covered songs
+  error: '#ef4444',      // Red - UI elements
 };
 
 /** Human-readable labels for each connection type */
@@ -696,6 +863,8 @@ const LINE_LABELS = {
   studio: 'Studio Line',
   writing: 'Writing Credits',
   label: 'Record Label',
+  feature: 'Featured Artist',
+  cover: 'Covered Songs',
 };
 
 /** Perpendicular offset for each line type to prevent overlap */
@@ -704,6 +873,8 @@ const LINE_TYPE_OFFSET = {
   studio: LINE_GAP,       // Blue - offset to one side
   writing: -LINE_GAP,     // Purple - offset to opposite side
   label: LINE_GAP * 1.5,  // Yellow - further offset
+  feature: -LINE_GAP * 1.5, // Orange - featured artist offset
+  cover: LINE_GAP * 2,    // Red - furthest offset
 };
 
 /**
@@ -778,10 +949,11 @@ export default function Counterpoint() {
   // ────────────────────────────────────────────────────────────────
 
   // UI theme
-  const [darkMode, setDarkMode] = useState(true);
+  // Dark mode is always on
+  const darkMode = true;
 
-  // Main graph data: artists and their connections
-  const [graph, setGraph] = useState({ artists: {}, connections: [] });
+  // Main graph data: artists and their connections (initialized from localStorage)
+  const [graph, setGraph] = useState(() => loadGraphFromStorage());
 
   // Selection state
   const [selectedStation, setSelectedStation] = useState(null);   // Selected artist
@@ -806,11 +978,29 @@ export default function Counterpoint() {
   // UI visibility
   const [showSearch, setShowSearch] = useState(true);
 
+  // Connection type filters (all visible by default)
+  const [visibleLineTypes, setVisibleLineTypes] = useState({
+    member: true,
+    studio: true,
+    writing: true,
+    label: true,
+    feature: true,
+    cover: true
+  });
+
   // SVG viewport and panning
   const svgRef = useRef(null);
   const [viewBox, setViewBox] = useState({ x: 0, y: 0, width: 800, height: 600 });
   const [isPanning, setIsPanning] = useState(false);
   const [panStart, setPanStart] = useState({ x: 0, y: 0 });
+
+  // Undo/Redo history
+  const [history, setHistory] = useState([]);
+  const [historyIndex, setHistoryIndex] = useState(-1);
+
+  // Mini-map viewport dragging
+  const [isMiniMapDragging, setIsMiniMapDragging] = useState(false);
+  const miniMapRef = useRef(null);
 
   // ────────────────────────────────────────────────────────────────
   // 6.2 DERIVED VALUES: Theme colors and memoized calculations
@@ -827,30 +1017,150 @@ export default function Counterpoint() {
     return getBundledConnections(graph.connections);
   }, [graph.connections]);
 
+  // Calculate suggested artists based on potential connections (memoized)
+  const suggestedArtists = useMemo(() => {
+    const counts = {};
+
+    // Count how many times each external artist is referenced
+    Object.values(graph.artists).forEach(artist => {
+      if (!artist.potentialConnections) return;
+
+      artist.potentialConnections.forEach(conn => {
+        // Skip if this artist is already on the map
+        if (graph.artists[conn.targetMbid]) return;
+
+        if (!counts[conn.targetMbid]) {
+          counts[conn.targetMbid] = {
+            mbid: conn.targetMbid,
+            name: conn.targetName,
+            count: 0,
+            connectionTypes: new Set(),
+            connectedFrom: []
+          };
+        }
+        counts[conn.targetMbid].count++;
+        counts[conn.targetMbid].connectionTypes.add(conn.type);
+        if (!counts[conn.targetMbid].connectedFrom.includes(artist.name)) {
+          counts[conn.targetMbid].connectedFrom.push(artist.name);
+        }
+      });
+    });
+
+    // Sort by count and return top 5
+    return Object.values(counts)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 5)
+      .map(s => ({
+        ...s,
+        connectionTypes: Array.from(s.connectionTypes)
+      }));
+  }, [graph.artists]);
+
+  // Calculate mini-map bounds (bounding box of all artists with padding)
+  const miniMapBounds = useMemo(() => {
+    const artists = Object.values(graph.artists);
+    if (artists.length === 0) return null;
+
+    const positions = artists.map(a => gridToPixel(a.x, a.y));
+    const minX = Math.min(...positions.map(p => p.x));
+    const maxX = Math.max(...positions.map(p => p.x));
+    const minY = Math.min(...positions.map(p => p.y));
+    const maxY = Math.max(...positions.map(p => p.y));
+
+    const padding = GRID_SIZE;
+    return {
+      x: minX - padding,
+      y: minY - padding,
+      width: Math.max(maxX - minX + padding * 2, GRID_SIZE * 2),
+      height: Math.max(maxY - minY + padding * 2, GRID_SIZE * 2)
+    };
+  }, [graph.artists]);
+
   // ────────────────────────────────────────────────────────────────
   // 6.3 HANDLERS: Search, add artist, explore connections
   // ────────────────────────────────────────────────────────────────
+
+  /**
+   * Push current graph state to history before making changes
+   * This enables undo functionality
+   */
+  const pushHistory = useCallback(() => {
+    const currentState = JSON.stringify(graph);
+    setHistory(prev => {
+      // Remove any future states if we're not at the end of history
+      const newHistory = prev.slice(0, historyIndex + 1);
+      // Add current state
+      newHistory.push(currentState);
+      // Limit history to 50 entries to prevent memory issues
+      if (newHistory.length > 50) {
+        newHistory.shift();
+        return newHistory;
+      }
+      return newHistory;
+    });
+    setHistoryIndex(prev => Math.min(prev + 1, 49));
+  }, [graph, historyIndex]);
+
+  /**
+   * Undo the last graph change
+   */
+  const undo = useCallback(() => {
+    if (historyIndex < 0) return;
+
+    // Save current state to allow redo if this is the first undo
+    if (historyIndex === history.length - 1) {
+      const currentState = JSON.stringify(graph);
+      setHistory(prev => [...prev, currentState]);
+    }
+
+    const prevState = JSON.parse(history[historyIndex]);
+    setGraph(prevState);
+    setHistoryIndex(prev => prev - 1);
+
+    // Clear selections that may no longer be valid
+    setSelectedStation(null);
+    setSelectedConnection(null);
+  }, [historyIndex, history, graph]);
+
+  /**
+   * Redo the last undone graph change
+   */
+  const redo = useCallback(() => {
+    if (historyIndex >= history.length - 2) return;
+
+    const nextState = JSON.parse(history[historyIndex + 2]);
+    setGraph(nextState);
+    setHistoryIndex(prev => prev + 1);
+
+    // Clear selections that may no longer be valid
+    setSelectedStation(null);
+    setSelectedConnection(null);
+  }, [historyIndex, history]);
+
+  // Derived values for undo/redo button states
+  const canUndo = historyIndex >= 0;
+  const canRedo = historyIndex < history.length - 2;
 
   /**
    * Search for artists using MusicBrainz API
    * Updates searchResults state with matching artists
    */
   const handleSearch = async () => {
-  if (!searchQuery.trim()) return;
-  
-  setIsSearching(true);
-  setError(null);
-  
-  try {
-    const results = await searchRealArtist(searchQuery);
-    setSearchResults(results);
-  } catch (err) {
-    setError('Failed to search artists. Please try again.');
-    console.error(err);
-  } finally {
-    setIsSearching(false);
-  }
-};
+    if (!searchQuery.trim()) return;
+
+    setIsSearching(true);
+    setError(null);
+
+    try {
+      const results = await searchRealArtist(searchQuery);
+      setSearchResults(results);
+    } catch (err) {
+      setError('Failed to search artists. Please try again.');
+      console.error(err);
+    } finally {
+      setIsSearching(false);
+    }
+  };
 
   /**
    * Add an artist to the graph by MBID
@@ -863,6 +1173,9 @@ export default function Counterpoint() {
       setError('Artist already added to the map');
       return;
     }
+
+    // Save current state to history before modification
+    pushHistory();
 
     setLoadingArtists(prev => new Set(prev).add(mbid));
     setError(null);
@@ -883,7 +1196,39 @@ export default function Counterpoint() {
       const wikidataId = extractWikidataId(artistData);
       const imageUrl = await fetchWikidataImage(wikidataId);
 
+      // Extract streaming service URLs
+      const streamingUrls = extractStreamingUrls(artistData);
+
       const hubPosition = calculateHubPosition(artistData);
+
+      // Get connections from artist relations
+      const connections = processRelationships(artistData);
+
+      // Check for featured artist connections with artists already on the map
+      const featuredConnections = await findFeatureConnections(mbid, graph.artists);
+      connections.push(...featuredConnections);
+
+      // Separate connections to artists on map vs potential connections
+      const newConnections = [];
+      const potentialConnections = [];
+      connections.forEach(conn => {
+        if (graph.artists[conn.targetMbid]) {
+          newConnections.push({
+            from: mbid,
+            to: conn.targetMbid,
+            type: conn.type,
+            data: conn.data
+          });
+        } else {
+          // Store for suggestions
+          potentialConnections.push({
+            targetMbid: conn.targetMbid,
+            targetName: conn.targetName,
+            type: conn.type,
+            data: conn.data
+          });
+        }
+      });
 
       const newArtist = {
         id: mbid,
@@ -894,23 +1239,11 @@ export default function Counterpoint() {
         works: works,
         labels: labels,
         imageUrl: imageUrl,
+        streamingUrls: streamingUrls,
+        potentialConnections: potentialConnections,
         x: hubPosition.x,
         y: hubPosition.y
       };
-
-      const connections = processRelationships(artistData);
-
-      const newConnections = [];
-      connections.forEach(conn => {
-        if (graph.artists[conn.targetMbid]) {
-          newConnections.push({
-            from: mbid,
-            to: conn.targetMbid,
-            type: conn.type,
-            data: conn.data
-          });
-        }
-      });
 
       // Find co-writers based on shared works
       const coWriterConnections = findCoWriters(mbid, works, graph.artists);
@@ -935,6 +1268,9 @@ export default function Counterpoint() {
       setSearchQuery('');
       setSearchResults([]);
 
+      // Auto-center the map to show the new artist
+      setTimeout(() => fitMapToView(), 100);
+
     } catch (err) {
       setError('Failed to add artist. Please try again.');
       console.error(err);
@@ -955,6 +1291,9 @@ export default function Counterpoint() {
   const exploreConnections = async (mbid) => {
     if (!graph.artists[mbid] || isExploring) return;
 
+    // Save current state to history before modification
+    pushHistory();
+
     setIsExploring(true);
     setLoadingArtists(prev => new Set(prev).add(mbid));
     setError(null);
@@ -967,7 +1306,12 @@ export default function Counterpoint() {
       const currentWorks = extractWrittenWorks(artistData);
       const currentLabels = extractLabels(artistData);
 
+      // Get connections from artist relations
       const connections = processRelationships(artistData);
+
+      // Check for featured artist connections with artists already on the map
+      const featuredConnections = await findFeatureConnections(mbid, graph.artists);
+      connections.push(...featuredConnections);
 
       const newArtists = {};
       const newConnections = [];
@@ -988,6 +1332,20 @@ export default function Counterpoint() {
             const wikidataId = extractWikidataId(relatedData);
             const imageUrl = await fetchWikidataImage(wikidataId);
 
+            // Extract streaming service URLs
+            const streamingUrls = extractStreamingUrls(relatedData);
+
+            // Get potential connections for this new artist
+            const relatedConnections = processRelationships(relatedData);
+            const relatedPotentialConns = relatedConnections
+              .filter(c => !graph.artists[c.targetMbid] && c.targetMbid !== mbid)
+              .map(c => ({
+                targetMbid: c.targetMbid,
+                targetName: c.targetName,
+                type: c.type,
+                data: c.data
+              }));
+
             newArtists[conn.targetMbid] = {
               id: conn.targetMbid,
               name: conn.targetName,
@@ -997,6 +1355,8 @@ export default function Counterpoint() {
               works: works,
               labels: labels,
               imageUrl: imageUrl,
+              streamingUrls: streamingUrls,
+              potentialConnections: relatedPotentialConns,
               x: hubPosition.x,
               y: hubPosition.y
             };
@@ -1091,11 +1451,137 @@ export default function Counterpoint() {
         connections: [...graph.connections, ...newConnections]
       });
 
+      // Auto-center the map to show all artists
+      setTimeout(() => fitMapToView(), 100);
+
     } catch (err) {
       setError('Failed to explore connections. Please try again.');
       console.error(err);
     } finally {
       setIsExploring(false);
+      setLoadingArtists(prev => {
+        const next = new Set(prev);
+        next.delete(mbid);
+        return next;
+      });
+    }
+  };
+
+  /**
+   * Remove an artist from the graph
+   * Also removes all connections involving that artist
+   * @param {string} mbid - MusicBrainz ID of artist to remove
+   */
+  const removeArtist = (mbid) => {
+    // Save current state to history before modification
+    pushHistory();
+
+    // Remove artist and all their connections
+    const newArtists = { ...graph.artists };
+    delete newArtists[mbid];
+
+    const newConnections = graph.connections.filter(
+      conn => conn.from !== mbid && conn.to !== mbid
+    );
+
+    // Clear selection if this artist was selected
+    if (selectedStation?.id === mbid) {
+      setSelectedStation(null);
+    }
+    if (startStation === mbid) {
+      setStartStation(null);
+    }
+    if (endStation === mbid) {
+      setEndStation(null);
+    }
+
+    setGraph({
+      artists: newArtists,
+      connections: newConnections
+    });
+  };
+
+  /**
+   * Refresh artist data (re-fetch from MusicBrainz to update streaming URLs, etc.)
+   * @param {string} mbid - MusicBrainz ID of artist to refresh
+   */
+  const refreshArtist = async (mbid) => {
+    if (!graph.artists[mbid]) return;
+
+    setLoadingArtists(prev => new Set(prev).add(mbid));
+    setError(null);
+
+    try {
+      const artistData = await getRealArtistDetails(mbid);
+      if (!artistData) return;
+
+      const wikidataId = extractWikidataId(artistData);
+      const imageUrl = await fetchWikidataImage(wikidataId);
+      const streamingUrls = extractStreamingUrls(artistData);
+      const works = extractWrittenWorks(artistData);
+      const labels = extractLabels(artistData);
+      const genres = extractGenres(artistData);
+
+      // Check for featured artist connections with artists already on the map
+      const featuredConnections = await findFeatureConnections(mbid, graph.artists);
+
+      // Create new connections for featured artists already on the map
+      const newConnections = [];
+      featuredConnections.forEach(conn => {
+        if (graph.artists[conn.targetMbid]) {
+          // Check if connection already exists
+          const exists = graph.connections.some(
+            c => (c.from === mbid && c.to === conn.targetMbid) ||
+                 (c.from === conn.targetMbid && c.to === mbid)
+          );
+          if (!exists) {
+            newConnections.push({
+              from: mbid,
+              to: conn.targetMbid,
+              type: conn.type,
+              data: conn.data
+            });
+          }
+        }
+      });
+
+      // Update the artist with fresh data and add new connections
+      setGraph(prev => ({
+        ...prev,
+        artists: {
+          ...prev.artists,
+          [mbid]: {
+            ...prev.artists[mbid],
+            imageUrl: imageUrl || prev.artists[mbid].imageUrl,
+            streamingUrls: streamingUrls,
+            works: works,
+            labels: labels,
+            genre: genres,
+            potentialConnections: [
+              ...(prev.artists[mbid].potentialConnections || []),
+              ...featuredConnections.filter(c => !prev.artists[c.targetMbid])
+            ]
+          }
+        },
+        connections: [...prev.connections, ...newConnections]
+      }));
+
+      // Update selected station if it's this artist
+      if (selectedStation?.id === mbid) {
+        setSelectedStation(prev => ({
+          ...prev,
+          imageUrl: imageUrl || prev.imageUrl,
+          streamingUrls: streamingUrls,
+          works: works,
+          labels: labels,
+          genre: genres
+        }));
+      }
+
+    } catch (err) {
+      setError('Failed to refresh artist data.');
+      console.error(err);
+    } finally {
       setLoadingArtists(prev => {
         const next = new Set(prev);
         next.delete(mbid);
@@ -1117,6 +1603,99 @@ export default function Counterpoint() {
       setRoute(null);
     }
   }, [startStation, endStation, graph]);
+
+  /** Persist graph to localStorage whenever it changes */
+  useEffect(() => {
+    saveGraphToStorage(graph);
+  }, [graph]);
+
+  /** Keyboard shortcuts */
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      // Don't trigger if user is typing in an input
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+
+      // Undo: Cmd+Z (Mac) or Ctrl+Z (Windows/Linux)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        undo();
+        return;
+      }
+
+      // Redo: Cmd+Shift+Z (Mac) or Ctrl+Shift+Z (Windows/Linux)
+      if ((e.metaKey || e.ctrlKey) && e.key === 'z' && e.shiftKey) {
+        e.preventDefault();
+        redo();
+        return;
+      }
+
+      switch (e.key) {
+        case 'Escape':
+          // Deselect everything
+          setSelectedStation(null);
+          setSelectedConnection(null);
+          break;
+        case 'Delete':
+        case 'Backspace':
+          // Remove selected artist
+          if (selectedStation) {
+            e.preventDefault();
+            removeArtist(selectedStation.id);
+          }
+          break;
+        default:
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [selectedStation, undo, redo]);
+
+  /**
+   * Fit the map view to show all artists with padding
+   */
+  const fitMapToView = () => {
+    const artists = Object.values(graph.artists);
+    if (artists.length === 0) {
+      // Reset to default view if no artists
+      setViewBox({ x: -400, y: -300, width: 800, height: 600 });
+      return;
+    }
+
+    // Calculate bounding box of all artists
+    const positions = artists.map(a => gridToPixel(a.x, a.y));
+    const minX = Math.min(...positions.map(p => p.x));
+    const maxX = Math.max(...positions.map(p => p.x));
+    const minY = Math.min(...positions.map(p => p.y));
+    const maxY = Math.max(...positions.map(p => p.y));
+
+    // Add padding
+    const padding = GRID_SIZE * 1.5;
+    const width = Math.max(maxX - minX + padding * 2, 400);
+    const height = Math.max(maxY - minY + padding * 2, 300);
+
+    // Get SVG aspect ratio
+    const svgRect = svgRef.current?.getBoundingClientRect();
+    const svgAspect = svgRect ? svgRect.width / svgRect.height : 4 / 3;
+    const contentAspect = width / height;
+
+    // Adjust to maintain aspect ratio
+    let finalWidth = width;
+    let finalHeight = height;
+    if (contentAspect > svgAspect) {
+      finalHeight = width / svgAspect;
+    } else {
+      finalWidth = height * svgAspect;
+    }
+
+    setViewBox({
+      x: minX - padding - (finalWidth - width) / 2,
+      y: minY - padding - (finalHeight - height) / 2,
+      width: finalWidth,
+      height: finalHeight
+    });
+  };
 
   // ────────────────────────────────────────────────────────────────
   // 6.5 PAN & ZOOM HANDLERS: Mouse events for map navigation
@@ -1169,6 +1748,71 @@ export default function Counterpoint() {
     });
   };
 
+  // Mini-map dimensions
+  const MINIMAP_WIDTH = 150;
+  const MINIMAP_HEIGHT = 100;
+
+  /** Convert mini-map click/drag position to main viewBox position */
+  const miniMapToViewBox = useCallback((clientX, clientY) => {
+    if (!miniMapRef.current || !miniMapBounds) return;
+
+    const rect = miniMapRef.current.getBoundingClientRect();
+    const relX = (clientX - rect.left) / rect.width;
+    const relY = (clientY - rect.top) / rect.height;
+
+    // Calculate the position in the world coordinates
+    const worldX = miniMapBounds.x + relX * miniMapBounds.width;
+    const worldY = miniMapBounds.y + relY * miniMapBounds.height;
+
+    // Center the viewport on this position
+    setViewBox(prev => ({
+      ...prev,
+      x: worldX - prev.width / 2,
+      y: worldY - prev.height / 2
+    }));
+  }, [miniMapBounds]);
+
+  /** Handle mini-map click to navigate */
+  const handleMiniMapClick = useCallback((e) => {
+    e.stopPropagation();
+    miniMapToViewBox(e.clientX, e.clientY);
+  }, [miniMapToViewBox]);
+
+  /** Handle mini-map mouse down for dragging viewport */
+  const handleMiniMapMouseDown = useCallback((e) => {
+    e.stopPropagation();
+    setIsMiniMapDragging(true);
+    miniMapToViewBox(e.clientX, e.clientY);
+  }, [miniMapToViewBox]);
+
+  /** Handle mini-map mouse move for dragging viewport */
+  const handleMiniMapMouseMove = useCallback((e) => {
+    if (isMiniMapDragging) {
+      miniMapToViewBox(e.clientX, e.clientY);
+    }
+  }, [isMiniMapDragging, miniMapToViewBox]);
+
+  /** Handle mini-map mouse up to stop dragging */
+  const handleMiniMapMouseUp = useCallback(() => {
+    setIsMiniMapDragging(false);
+  }, []);
+
+  // Add global mouse up listener for mini-map dragging
+  useEffect(() => {
+    if (isMiniMapDragging) {
+      const handleGlobalMouseUp = () => setIsMiniMapDragging(false);
+      const handleGlobalMouseMove = (e) => miniMapToViewBox(e.clientX, e.clientY);
+
+      window.addEventListener('mouseup', handleGlobalMouseUp);
+      window.addEventListener('mousemove', handleGlobalMouseMove);
+
+      return () => {
+        window.removeEventListener('mouseup', handleGlobalMouseUp);
+        window.removeEventListener('mousemove', handleGlobalMouseMove);
+      };
+    }
+  }, [isMiniMapDragging, miniMapToViewBox]);
+
   // ────────────────────────────────────────────────────────────────
   // 6.6 HELPER FUNCTIONS: Route checking
   // ────────────────────────────────────────────────────────────────
@@ -1176,7 +1820,7 @@ export default function Counterpoint() {
   /** Check if a connection is part of the current route */
   const isConnectionInRoute = (conn) => {
     if (!route) return false;
-    return route.some(step => 
+    return route.some(step =>
       (step.conn.from === conn.from && step.conn.to === conn.to) ||
       (step.conn.from === conn.to && step.conn.to === conn.from)
     );
@@ -1306,6 +1950,73 @@ export default function Counterpoint() {
           )}
         </div>
 
+        {/* Suggestions Section */}
+        {suggestedArtists.length > 0 && (
+          <div style={{ padding: '16px', borderBottom: `2px solid ${borderColor}` }}>
+            <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: '0 0 12px 0' }}>
+              SUGGESTED ({suggestedArtists.length})
+            </h3>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {suggestedArtists.map(suggestion => (
+                <div
+                  key={suggestion.mbid}
+                  onClick={() => addArtistToGraph(suggestion.mbid, suggestion.name)}
+                  style={{
+                    padding: '10px',
+                    background: darkMode ? '#1a1a1a' : '#ffffff',
+                    border: `2px solid ${borderColor}`,
+                    borderRadius: '4px',
+                    cursor: loadingArtists.has(suggestion.mbid) ? 'not-allowed' : 'pointer',
+                    opacity: loadingArtists.has(suggestion.mbid) ? 0.5 : 1,
+                    transition: 'border-color 0.2s ease'
+                  }}
+                >
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: '13px', fontWeight: 'bold', marginBottom: '4px' }}>
+                        {suggestion.name}
+                      </div>
+                      <div style={{ fontSize: '10px', color: mutedText, marginBottom: '6px' }}>
+                        via {suggestion.connectedFrom.slice(0, 2).join(', ')}
+                        {suggestion.connectedFrom.length > 2 && ` +${suggestion.connectedFrom.length - 2} more`}
+                      </div>
+                      <div style={{ display: 'flex', gap: '4px', flexWrap: 'wrap' }}>
+                        {suggestion.connectionTypes.map(type => (
+                          <span
+                            key={type}
+                            style={{
+                              fontSize: '9px',
+                              padding: '2px 6px',
+                              background: LINE_COLORS[type],
+                              color: '#ffffff',
+                              borderRadius: '2px',
+                              fontWeight: 'bold'
+                            }}
+                          >
+                            {type}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{
+                      fontSize: '14px',
+                      fontWeight: 'bold',
+                      color: LINE_COLORS.member,
+                      marginLeft: '8px'
+                    }}>
+                      {loadingArtists.has(suggestion.mbid) ? (
+                        <Loader size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                      ) : (
+                        <Plus size={16} />
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         <div style={{ flex: 1, overflowY: 'auto', padding: '16px' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
             <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: 0 }}>
@@ -1314,6 +2025,7 @@ export default function Counterpoint() {
             {Object.keys(graph.artists).length > 0 && (
               <button
                 onClick={() => {
+                  pushHistory();
                   setGraph({ artists: {}, connections: [] });
                   setSelectedStation(null);
                   setStartStation(null);
@@ -1380,47 +2092,79 @@ export default function Counterpoint() {
           </div>
         </div>
 
-        <div style={{ padding: '16px', borderTop: `2px solid ${borderColor}`, background: darkMode ? '#000000' : '#ffffff' }}>
+        </div>
+
+      {/* Main Map */}
+      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
+        <div style={{
+          position: 'absolute',
+          top: '16px',
+          left: '16px',
+          zIndex: 10,
+          display: 'flex',
+          gap: '8px'
+        }}>
           <button
-            onClick={() => setDarkMode(!darkMode)}
+            onClick={() => setShowSearch(!showSearch)}
             style={{
-              width: '100%',
-              padding: '12px',
+              padding: '10px',
               background: darkMode ? '#1a1a1a' : '#ffffff',
               border: `2px solid ${borderColor}`,
               borderRadius: '4px',
               cursor: 'pointer',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              gap: '8px',
               color: textColor
             }}
+            title={showSearch ? 'Hide panel' : 'Show panel'}
           >
-            {darkMode ? <Sun size={16} /> : <Moon size={16} />}
-            {darkMode ? 'Light Mode' : 'Dark Mode'}
+            {showSearch ? <X size={20} /> : <Search size={20} />}
+          </button>
+          <button
+            onClick={fitMapToView}
+            style={{
+              padding: '10px',
+              background: darkMode ? '#1a1a1a' : '#ffffff',
+              border: `2px solid ${borderColor}`,
+              borderRadius: '4px',
+              cursor: 'pointer',
+              color: textColor
+            }}
+            title="Fit all artists in view"
+          >
+            <Maximize size={20} />
+          </button>
+          <button
+            onClick={undo}
+            disabled={!canUndo}
+            style={{
+              padding: '10px',
+              background: darkMode ? '#1a1a1a' : '#ffffff',
+              border: `2px solid ${borderColor}`,
+              borderRadius: '4px',
+              cursor: canUndo ? 'pointer' : 'not-allowed',
+              color: textColor,
+              opacity: canUndo ? 1 : 0.4
+            }}
+            title="Undo (Cmd+Z)"
+          >
+            <Undo2 size={20} />
+          </button>
+          <button
+            onClick={redo}
+            disabled={!canRedo}
+            style={{
+              padding: '10px',
+              background: darkMode ? '#1a1a1a' : '#ffffff',
+              border: `2px solid ${borderColor}`,
+              borderRadius: '4px',
+              cursor: canRedo ? 'pointer' : 'not-allowed',
+              color: textColor,
+              opacity: canRedo ? 1 : 0.4
+            }}
+            title="Redo (Cmd+Shift+Z)"
+          >
+            <Redo2 size={20} />
           </button>
         </div>
-      </div>
-
-      {/* Main Map */}
-      <div style={{ flex: 1, position: 'relative', overflow: 'hidden' }}>
-        <button
-          onClick={() => setShowSearch(!showSearch)}
-          style={{
-            position: 'absolute',
-            top: '16px',
-            left: '16px',
-            zIndex: 10,
-            padding: '10px',
-            background: darkMode ? '#1a1a1a' : '#ffffff',
-            border: `2px solid ${borderColor}`,
-            borderRadius: '4px',
-            cursor: 'pointer'
-          }}
-        >
-          {showSearch ? <X size={20} /> : <Search size={20} />}
-        </button>
 
         {/* Exploring Connections Overlay */}
         {isExploring && (
@@ -1478,13 +2222,41 @@ export default function Counterpoint() {
           padding: '12px',
           fontSize: '11px'
         }}>
-          <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>LEGEND</div>
+          <div style={{ fontWeight: 'bold', marginBottom: '8px' }}>FILTER LINES</div>
           {Object.entries(LINE_LABELS).map(([type, label]) => (
-            <div key={type} style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px' }}>
-              <div style={{ width: '20px', height: '4px', background: LINE_COLORS[type] }} />
-              <span>{label}</span>
+            <div
+              key={type}
+              onClick={() => setVisibleLineTypes(prev => ({ ...prev, [type]: !prev[type] }))}
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                marginBottom: '4px',
+                cursor: 'pointer',
+                opacity: visibleLineTypes[type] ? 1 : 0.4,
+                transition: 'opacity 0.2s ease'
+              }}
+            >
+              <div style={{
+                width: '20px',
+                height: '4px',
+                background: LINE_COLORS[type],
+                borderRadius: '2px'
+              }} />
+              <span style={{
+                textDecoration: visibleLineTypes[type] ? 'none' : 'line-through'
+              }}>{label}</span>
             </div>
           ))}
+          <div style={{
+            marginTop: '8px',
+            paddingTop: '8px',
+            borderTop: `1px solid ${borderColor}`,
+            fontSize: '9px',
+            color: mutedText
+          }}>
+            Click to toggle
+          </div>
         </div>
 
         {/* Route Info - positioned below legend */}
@@ -1801,7 +2573,7 @@ export default function Counterpoint() {
           <rect width="10000" height="10000" fill="url(#grid)" />
 
           {/* CONNECTIONS LAYER */}
-          {graph.connections.map((conn, idx) => {
+          {graph.connections.filter(conn => visibleLineTypes[conn.type]).map((conn, idx) => {
             const from = graph.artists[conn.from];
             const to = graph.artists[conn.to];
             if (!from || !to) return null;
@@ -1867,9 +2639,16 @@ export default function Counterpoint() {
             const isEnd = endStation === artist.id;
             const isInRoute = route?.some(step => step.artistId === artist.id);
             const showLabel = isSelected || isHovered;
+            const clipId = `clip-${artist.id}`;
 
             return (
               <g key={artist.id} style={{ transition: 'opacity 0.3s ease, transform 0.3s ease' }}>
+                {/* Clip path for circular image */}
+                <defs>
+                  <clipPath id={clipId}>
+                    <circle cx={pos.x} cy={pos.y} r={STATION_RADIUS - 2} />
+                  </clipPath>
+                </defs>
                 {/* White outline */}
                 <circle
                   cx={pos.x}
@@ -1896,11 +2675,34 @@ export default function Counterpoint() {
                   onMouseLeave={() => setHoveredStation(null)}
                   style={{ cursor: 'pointer', transition: 'all 0.3s ease' }}
                 />
+                {/* Artist photo inside circle */}
+                {artist.imageUrl && (
+                  <image
+                    href={artist.imageUrl}
+                    x={pos.x - STATION_RADIUS + 2}
+                    y={pos.y - STATION_RADIUS + 2}
+                    width={(STATION_RADIUS - 2) * 2}
+                    height={(STATION_RADIUS - 2) * 2}
+                    clipPath={`url(#${clipId})`}
+                    preserveAspectRatio="xMidYMid slice"
+                    style={{ pointerEvents: 'none' }}
+                  />
+                )}
+                {/* Border ring on top of image */}
+                <circle
+                  cx={pos.x}
+                  cy={pos.y}
+                  r={STATION_RADIUS}
+                  fill="none"
+                  stroke={isStart ? LINE_COLORS.member : (isEnd ? '#dc2626' : (isSelected ? '#ffffff' : (isInRoute ? '#ffffff' : borderColor)))}
+                  strokeWidth={isInRoute || isStart || isEnd ? 5 : 4}
+                  style={{ pointerEvents: 'none', transition: 'all 0.3s ease' }}
+                />
                 {/* Label - only show on hover or selection */}
                 {showLabel && (
                   <text
                     x={pos.x}
-                    y={pos.y - 30}
+                    y={pos.y - STATION_RADIUS - 10}
                     textAnchor="middle"
                     fontSize="15"
                     fontWeight="bold"
@@ -1914,6 +2716,105 @@ export default function Counterpoint() {
             );
           })}
         </svg>
+
+        {/* Mini-Map - only show when there are artists on the map */}
+        {miniMapBounds && Object.keys(graph.artists).length > 0 && (
+          <div
+            ref={miniMapRef}
+            style={{
+              position: 'absolute',
+              bottom: '16px',
+              left: '16px',
+              width: `${MINIMAP_WIDTH}px`,
+              height: `${MINIMAP_HEIGHT}px`,
+              background: darkMode ? 'rgba(0,0,0,0.85)' : 'rgba(255,255,255,0.85)',
+              border: `1px solid ${borderColor}`,
+              borderRadius: '4px',
+              overflow: 'hidden',
+              cursor: isMiniMapDragging ? 'grabbing' : 'pointer',
+              zIndex: 20,
+              boxShadow: '0 2px 8px rgba(0,0,0,0.3)'
+            }}
+            onMouseDown={handleMiniMapMouseDown}
+            onMouseMove={handleMiniMapMouseMove}
+            onMouseUp={handleMiniMapMouseUp}
+            onClick={handleMiniMapClick}
+          >
+            <svg
+              width="100%"
+              height="100%"
+              viewBox={`${miniMapBounds.x} ${miniMapBounds.y} ${miniMapBounds.width} ${miniMapBounds.height}`}
+              style={{ pointerEvents: 'none' }}
+            >
+              {/* Connection lines (simplified) */}
+              {graph.connections.filter(conn => visibleLineTypes[conn.type]).map((conn, idx) => {
+                const from = graph.artists[conn.from];
+                const to = graph.artists[conn.to];
+                if (!from || !to) return null;
+
+                const fromPos = gridToPixel(from.x, from.y);
+                const toPos = gridToPixel(to.x, to.y);
+
+                return (
+                  <line
+                    key={idx}
+                    x1={fromPos.x}
+                    y1={fromPos.y}
+                    x2={toPos.x}
+                    y2={toPos.y}
+                    stroke={LINE_COLORS[conn.type]}
+                    strokeWidth={miniMapBounds.width / 50}
+                    opacity={0.6}
+                  />
+                );
+              })}
+
+              {/* Artist dots */}
+              {Object.values(graph.artists).map(artist => {
+                const pos = gridToPixel(artist.x, artist.y);
+                const dotRadius = miniMapBounds.width / 40;
+
+                return (
+                  <circle
+                    key={artist.id}
+                    cx={pos.x}
+                    cy={pos.y}
+                    r={dotRadius}
+                    fill={darkMode ? '#ffffff' : '#000000'}
+                    opacity={0.8}
+                  />
+                );
+              })}
+
+              {/* Viewport rectangle */}
+              <rect
+                x={viewBox.x}
+                y={viewBox.y}
+                width={viewBox.width}
+                height={viewBox.height}
+                fill={darkMode ? 'rgba(255,255,255,0.1)' : 'rgba(0,0,0,0.1)'}
+                stroke={LINE_COLORS.member}
+                strokeWidth={miniMapBounds.width / 75}
+                rx={miniMapBounds.width / 100}
+              />
+            </svg>
+
+            {/* Mini-map label */}
+            <div style={{
+              position: 'absolute',
+              top: '4px',
+              left: '6px',
+              fontSize: '8px',
+              fontWeight: 'bold',
+              color: mutedText,
+              textTransform: 'uppercase',
+              letterSpacing: '0.5px',
+              pointerEvents: 'none'
+            }}>
+              Map
+            </div>
+          </div>
+        )}
 
         {selectedStation && (
           <div style={{
@@ -1993,39 +2894,116 @@ export default function Counterpoint() {
               </button>
             </div>
 
-            <button
-              onClick={() => exploreConnections(selectedStation.id)}
-              disabled={loadingArtists.has(selectedStation.id)}
-              style={{
-                width: '100%',
-                padding: '10px',
-                background: LINE_COLORS.studio,
-                color: '#ffffff',
-                border: 'none',
-                borderRadius: '4px',
-                cursor: loadingArtists.has(selectedStation.id) ? 'not-allowed' : 'pointer',
-                opacity: loadingArtists.has(selectedStation.id) ? 0.5 : 1,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                gap: '8px'
-              }}
-            >
-              {loadingArtists.has(selectedStation.id) ? (
-                <>
-                  <Loader size={14} />
-                  Exploring...
-                </>
-              ) : (
-                <>
-                  <Plus size={14} />
-                  Explore Connections
-                </>
-              )}
-            </button>
+            <div style={{ display: 'flex', gap: '8px' }}>
+              <button
+                onClick={() => exploreConnections(selectedStation.id)}
+                disabled={loadingArtists.has(selectedStation.id)}
+                style={{
+                  flex: 1,
+                  padding: '10px',
+                  background: LINE_COLORS.studio,
+                  color: '#ffffff',
+                  border: 'none',
+                  borderRadius: '4px',
+                  cursor: loadingArtists.has(selectedStation.id) ? 'not-allowed' : 'pointer',
+                  opacity: loadingArtists.has(selectedStation.id) ? 0.5 : 1,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '8px'
+                }}
+              >
+                {loadingArtists.has(selectedStation.id) ? (
+                  <>
+                    <Loader size={14} />
+                    Exploring...
+                  </>
+                ) : (
+                  <>
+                    <Plus size={14} />
+                    Explore
+                  </>
+                )}
+              </button>
+              <button
+                onClick={() => refreshArtist(selectedStation.id)}
+                disabled={loadingArtists.has(selectedStation.id)}
+                style={{
+                  padding: '10px 14px',
+                  background: 'transparent',
+                  color: LINE_COLORS.studio,
+                  border: `2px solid ${LINE_COLORS.studio}`,
+                  borderRadius: '4px',
+                  cursor: loadingArtists.has(selectedStation.id) ? 'not-allowed' : 'pointer',
+                  opacity: loadingArtists.has(selectedStation.id) ? 0.5 : 1,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+                title="Refresh artist data"
+              >
+                <RefreshCw size={14} style={{ animation: loadingArtists.has(selectedStation.id) ? 'spin 1s linear infinite' : 'none' }} />
+              </button>
+              <button
+                onClick={() => removeArtist(selectedStation.id)}
+                style={{
+                  padding: '10px 14px',
+                  background: 'transparent',
+                  color: LINE_COLORS.error,
+                  border: `2px solid ${LINE_COLORS.error}`,
+                  borderRadius: '4px',
+                  cursor: 'pointer',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+                title="Remove artist"
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+
+            {/* Streaming Services - dropdown for available services */}
+            {selectedStation.streamingUrls &&
+             (selectedStation.streamingUrls.spotify || selectedStation.streamingUrls.appleMusic || selectedStation.streamingUrls.tidal) && (
+              <div style={{ marginTop: '12px' }}>
+                <select
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      window.open(e.target.value, '_blank');
+                      e.target.value = '';
+                    }
+                  }}
+                  defaultValue=""
+                  style={{
+                    width: '100%',
+                    padding: '10px 12px',
+                    background: darkMode ? '#1a1a1a' : '#ffffff',
+                    color: textColor,
+                    border: `2px solid ${LINE_COLORS.member}`,
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '12px',
+                    fontWeight: 'bold',
+                    appearance: 'none'
+                  }}
+                >
+                  <option value="">Listen on...</option>
+                  {selectedStation.streamingUrls.spotify && (
+                    <option value={selectedStation.streamingUrls.spotify}>Spotify</option>
+                  )}
+                  {selectedStation.streamingUrls.appleMusic && (
+                    <option value={selectedStation.streamingUrls.appleMusic}>Apple Music</option>
+                  )}
+                  {selectedStation.streamingUrls.tidal && (
+                    <option value={selectedStation.streamingUrls.tidal}>Tidal</option>
+                  )}
+                </select>
+              </div>
+            )}
 
             <div style={{ marginTop: '12px', fontSize: '10px', color: mutedText, fontStyle: 'italic' }}>
-              Double-click station to explore
+              Double-click station to explore • Delete key to remove
             </div>
           </div>
         )}
